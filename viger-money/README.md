@@ -1,4 +1,4 @@
-# VIGER MONEY — Personal Finance Web App
+# VIGER MONEY 2.0 — Personal Finance Web App
 
 A responsive, local-first personal money ledger for desktop and mobile. The app is plain HTML/CSS/JavaScript and has no build step or runtime framework dependency.
 
@@ -12,6 +12,8 @@ A responsive, local-first personal money ledger for desktop and mobile. The app 
 - Multiple wallets, editable opening balances and wallet archive/restore.
 - Search, filters, edit, soft-delete, audit records and `Ctrl+Z` undo for transaction changes.
 - Dashboard, current-month metrics, category summaries, cash-flow visualization and savings goals.
+- Money Forecast Engine: 7/30/90/180-day forecasts, cautious/realistic/optimistic scenarios, recent cash-flow analysis, and conservative recurring-pattern detection.
+- Mobile-first bottom navigation with a central quick-add action; forecast is directly accessible on phones.
 - JSON backup/restore, CSV export, dark/light/system theme and keyboard shortcuts.
 - PWA manifest and service worker for installation/offline app shell on a suitable origin.
 - Optional Supabase Auth/REST sync, with the SQL schema and row-level security policies included.
@@ -62,7 +64,8 @@ Cloud sync is not active until you configure your own Supabase project. The app 
 - `Esc`: close modal/menu
 - `Ctrl+Z` / `Cmd+Z`: undo the latest transaction create/edit/delete
 - `Ctrl+E` / `Cmd+E`: export transaction CSV
-- `1`–`5`: dashboard, history, wallets, statistics, goals
+- `1`–`6`: dashboard, history, wallets, statistics, goals, forecast
+- `F`: open forecast
 
 Shortcuts that could interfere with typing are disabled while a form field is focused.
 
@@ -73,3 +76,19 @@ Shortcuts that could interfere with typing are disabled while a form field is fo
 - Transfers change the source and destination wallets without inflating the income/expense totals.
 - Deleted transactions are soft-deleted locally; they stop affecting balances but remain in the audit/export history.
 - A local browser database is not a substitute for a password manager, encrypted backup or bank system.
+
+
+## Money Forecast Engine
+
+Open **Прогноз** and choose a date or a 7/30/90/180-day preset (the date picker allows up to one year). The calculation uses up to 90 days of income/expense history and excludes transfers between the user's own wallets. The baseline weights the last 30 observed days at 65% and the preceding observed period at 35%. Stable weekly, biweekly or monthly patterns are detected only when there are at least three similar transactions with sufficiently consistent dates and amounts; those entries are separated from the baseline and projected as future events. The result includes cautious, realistic and optimistic scenarios, with uncertainty widened according to observed weekly cash-flow variation.
+
+The app computes the forecast locally; no transaction history is sent to an AI service. Confidence is intentionally reduced when history is sparse. This is an estimate, not a guarantee: unrecorded purchases, irregular income and changes in habits affect the result. Keep recording transactions and retain backups.
+
+### Updating an existing install
+
+1. Export a JSON backup from the old version before replacing files.
+2. Extract this release and deploy the full folder to the **same website address/origin** as the previous version. Do not switch from `www` to non-`www`, or to a different hosting URL, unless you have exported and restored the backup.
+3. Reload the page. The database name and IndexedDB schema version are unchanged, so existing local records remain in place. The service worker cache version is bumped to load the new UI.
+4. On a phone, close and reopen the installed PWA or reload the site after it has updated.
+
+Do not clear site data or browser storage during the update. The app does not have access to a user's live phone database from this ZIP; it updates the application code while preserving the existing same-origin storage.

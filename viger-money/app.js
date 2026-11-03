@@ -199,7 +199,8 @@
     currentPage = page;
     $$('.page').forEach(node => node.classList.toggle('active', node.id === `page-${page}`));
     $$('.nav-link[data-page], .mobile-nav-link[data-page]').forEach(btn => btn.classList.toggle('active', btn.dataset.page === page));
-    const labels = { dashboard: 'Главная', transactions: 'История', wallets: 'Кошельки', insights: 'Статистика', goals: 'Цели', settings: 'Настройки' };
+    const moreButton = $('[data-mobile-more]'); if (moreButton) moreButton.classList.toggle('active', ['wallets', 'insights', 'goals', 'settings'].includes(page));
+    const labels = { dashboard: 'Главная', transactions: 'История', wallets: 'Кошельки', insights: 'Статистика', forecast: 'Прогноз', goals: 'Цели', settings: 'Настройки' };
     $('#pageTitle').textContent = labels[page] || 'Главная';
     $('#sidebar').classList.remove('open');
     window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
@@ -210,7 +211,7 @@
   function renderAll() {
     if (!state) return;
     applyTheme();
-    renderDashboard(); renderHistory(); renderWallets(); renderInsights(); renderGoals(); renderSettings();
+    renderDashboard(); renderHistory(); renderWallets(); renderInsights(); renderForecast(); renderGoals(); renderSettings();
   }
   function renderDashboard() {
     $('#todayLabel').textContent = `ТВОИ ДЕНЬГИ · ${new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' }).toUpperCase()}`;
@@ -326,6 +327,192 @@
     $('#categoryChart').innerHTML = cats.length ? cats.slice(0, 8).map(([cat, amount]) => `<div class="category-chart-row"><span class="category-chart-icon">${esc(categoryMeta[cat]?.icon || '•')}</span><div class="category-chart-detail"><strong>${esc(cat)}</strong><span class="category-bar"><span style="width:${amount / maxCat * 100}%;background:${esc(categoryMeta[cat]?.color || '#83e0a5')}"></span></span></div><span class="category-chart-amount">${money(amount)}</span></div>`).join('') : `<div class="empty-inline">Добавь расходы, чтобы увидеть разбивку.</div>`;
     const byMonth = new Map(); activeTransactions().forEach(tx => { const key = monthKey(tx.occurredAt); if (!byMonth.has(key)) byMonth.set(key, { income: 0, expense: 0, count: 0 }); if (tx.type === 'income') byMonth.get(key).income += Number(tx.amount); if (tx.type === 'expense') byMonth.get(key).expense += Number(tx.amount); byMonth.get(key).count++; });
     $('#monthlyTable').innerHTML = byMonth.size ? `<table><thead><tr><th>МЕСЯЦ</th><th>ПРИХОДЫ</th><th>РАСХОДЫ</th><th>РАЗНИЦА</th><th>ОПЕРАЦИЙ</th></tr></thead><tbody>${[...byMonth.entries()].sort((a, b) => b[0].localeCompare(a[0])).slice(0, 12).map(([key, vals]) => `<tr><td>${esc(monthTitle(key))}</td><td style="color:var(--green)">+${money(vals.income)}</td><td style="color:var(--red)">−${money(vals.expense)}</td><td style="color:${vals.income - vals.expense >= 0 ? 'var(--green)' : 'var(--red)'}">${vals.income - vals.expense >= 0 ? '+' : '−'}${money(Math.abs(vals.income - vals.expense))}</td><td>${vals.count}</td></tr>`).join('')}</tbody></table>` : `<div class="empty-inline">Сводка появится после первых операций.</div>`;
+  }
+
+  const FORECAST_DAY_MS = 86400000;
+  const localDay = value => { const d = new Date(value); d.setHours(0, 0, 0, 0); return d; };
+  const dateInputValue = value => { const d = new Date(value); const p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
+  const formatForecastDate = value => new Date(`${value}T12:00:00`).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
+  const sum = values => values.reduce((acc, value) => acc + value, 0);
+  const average = values => values.length ? sum(values) / values.length : 0;
+  const standardDeviation = values => { if (values.length < 2) return 0; const mean = average(values); return Math.sqrt(average(values.map(value => (value - mean) ** 2))); };
+
+  function detectRecurringPatterns(transactions, today, target) {
+    const groups = new Map();
+    for (const tx of transactions) {
+      if (tx.type !== 'income' && tx.type !== 'expense') continue;
+      const description = String(tx.description || '').toLowerCase().replace(/\d+/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+      const signature = `${tx.type}|${tx.category || 'Прочее'}|${description || (tx.category || 'Без описания').toLowerCase()}`;
+      if (!groups.has(signature)) groups.set(signature, []);
+      groups.get(signature).push(tx);
+    }
+    const patterns = [];
+    for (const [signature, entries] of groups) {
+      if (entries.length < 3) continue;
+      const ordered = entries.slice().sort((a, b) => new Date(a.occurredAt) - new Date(b.occurredAt));
+      const gaps = ordered.slice(1).map((tx, index) => (new Date(tx.occurredAt) - new Date(ordered[index].occurredAt)) / FORECAST_DAY_MS);
+      const sortedGaps = gaps.slice().sort((a, b) => a - b);
+      const cadence = sortedGaps[Math.floor(sortedGaps.length / 2)];
+      let cadenceLabel = '';
+      if (cadence >= 5 && cadence <= 9) cadenceLabel = 'примерно раз в неделю';
+      else if (cadence >= 12 && cadence <= 16) cadenceLabel = 'примерно раз в две недели';
+      else if (cadence >= 25 && cadence <= 35) cadenceLabel = 'примерно раз в месяц';
+      if (!cadenceLabel) continue;
+      const gapDeviation = average(gaps.map(gap => Math.abs(gap - cadence)));
+      if (gapDeviation / cadence > 0.20) continue;
+      const amounts = ordered.map(tx => Number(tx.amount) || 0);
+      const meanAmount = average(amounts);
+      if (!meanAmount || standardDeviation(amounts) / meanAmount > 0.28) continue;
+      const sortedAmounts = amounts.slice().sort((a, b) => a - b);
+      const middle = Math.floor(sortedAmounts.length / 2);
+      const medianAmount = sortedAmounts.length % 2 ? sortedAmounts[middle] : (sortedAmounts[middle - 1] + sortedAmounts[middle]) / 2;
+      const last = ordered[ordered.length - 1];
+      let due = new Date(last.occurredAt);
+      let guard = 0;
+      const nowMoment = new Date();
+      while (due <= nowMoment && guard++ < 30) due = new Date(due.getTime() + cadence * FORECAST_DAY_MS);
+      if (due > target) continue;
+      const events = [];
+      while (due <= target && events.length < 40) {
+        const dayOffset = Math.max(0, Math.ceil((localDay(due) - today) / FORECAST_DAY_MS));
+        events.push({ date: dateInputValue(due), day: dayOffset, type: last.type, amount: medianAmount, category: last.category || 'Прочее', description: last.description || last.category || (last.type === 'income' ? 'Повторяющееся поступление' : 'Повторяющийся расход') });
+        due = new Date(due.getTime() + cadence * FORECAST_DAY_MS);
+      }
+      if (events.length) patterns.push({ signature, type: last.type, category: last.category || 'Прочее', description: last.description || last.category || (last.type === 'income' ? 'Поступление' : 'Расход'), amount: medianAmount, cadence, cadenceLabel, ids: ordered.map(tx => tx.id), events });
+    }
+    return patterns;
+  }
+
+  function buildForecastModel(horizonDays) {
+    const now = new Date();
+    const today = localDay(now);
+    const target = new Date(today.getTime() + Math.max(0, horizonDays) * FORECAST_DAY_MS);
+    target.setHours(23, 59, 59, 999);
+    const historyStart = new Date(today.getTime() - 89 * FORECAST_DAY_MS);
+    const historyTransactions = activeTransactions().filter(tx => {
+      const time = new Date(tx.occurredAt).getTime();
+      return (tx.type === 'income' || tx.type === 'expense') && time >= historyStart.getTime() && time <= now.getTime();
+    });
+    const patterns = detectRecurringPatterns(historyTransactions, today, target);
+    const recurringIds = new Set(patterns.flatMap(pattern => pattern.ids));
+    const residualDaily = Array(90).fill(0);
+    const incomeDaily = Array(90).fill(0);
+    const expenseDaily = Array(90).fill(0);
+    for (const tx of historyTransactions) {
+      const dayIndex = Math.floor((localDay(tx.occurredAt).getTime() - historyStart.getTime()) / FORECAST_DAY_MS);
+      if (dayIndex < 0 || dayIndex >= 90) continue;
+      const signed = (tx.type === 'income' ? 1 : -1) * (Number(tx.amount) || 0);
+      if (tx.type === 'income') incomeDaily[dayIndex] += Number(tx.amount) || 0;
+      else expenseDaily[dayIndex] += Number(tx.amount) || 0;
+      if (!recurringIds.has(tx.id)) residualDaily[dayIndex] += signed;
+    }
+    const flowEntries = historyTransactions.length;
+    const activeDays = new Set(historyTransactions.map(tx => dateInputValue(tx.occurredAt))).size;
+    const earliest = historyTransactions.length ? Math.min(...historyTransactions.map(tx => localDay(tx.occurredAt).getTime())) : today.getTime();
+    const historySpan = historyTransactions.length ? Math.min(90, Math.floor((today.getTime() - earliest) / FORECAST_DAY_MS) + 1) : 0;
+    const daysObserved = historySpan;
+    const recentCount = Math.min(30, daysObserved);
+    const previousCount = Math.min(60, Math.max(0, daysObserved - recentCount));
+    const recent = recentCount ? residualDaily.slice(90 - recentCount) : [];
+    const previous = previousCount ? residualDaily.slice(90 - recentCount - previousCount, 90 - recentCount) : [];
+    const recentDaily = average(recent);
+    const previousDaily = average(previous);
+    const baseDaily = previous.length ? recentDaily * 0.65 + previousDaily * 0.35 : recentDaily;
+    const observedResidual = daysObserved ? residualDaily.slice(90 - daysObserved) : [];
+    const weeklyResidual = [];
+    for (let i = 0; i < observedResidual.length; i += 7) { const week = observedResidual.slice(i, i + 7); weeklyResidual.push(sum(week) / Math.max(1, week.length) * 7); }
+    const weeklySpread = standardDeviation(weeklyResidual.slice(-10));
+    let confidence = 'low';
+    if (historySpan >= 60 && flowEntries >= 25 && activeDays >= 16) confidence = 'high';
+    else if (historySpan >= 30 && flowEntries >= 8 && activeDays >= 5) confidence = 'medium';
+    const current = totalBalance();
+    const events = patterns.flatMap(pattern => pattern.events);
+    const project = [];
+    for (let day = 0; day <= horizonDays; day++) {
+      const dueEvents = events.filter(event => event.day === day);
+      const center = current + baseDaily * day + sum(dueEvents.map(event => (event.type === 'income' ? 1 : -1) * event.amount));
+      const lowEvents = sum(dueEvents.map(event => event.type === 'income' ? event.amount * 0.85 : -event.amount * 1.15));
+      const highEvents = sum(dueEvents.map(event => event.type === 'income' ? event.amount * 1.15 : -event.amount * 0.85));
+      const uncertainty = weeklySpread * Math.sqrt(Math.max(0, day / 7));
+      project.push({ day, base: center, low: current + baseDaily * day + lowEvents - uncertainty, high: current + baseDaily * day + highEvents + uncertainty });
+    }
+    const last = project[project.length - 1] || { base: current, low: current, high: current };
+    const last30Income = sum(incomeDaily.slice(-30));
+    const last30Expense = sum(expenseDaily.slice(-30));
+    return {
+      current, horizonDays, target, baseDaily, weeklySpread, confidence, historySpan, flowEntries, activeDays,
+      patterns, events, last30Income, last30Expense,
+      forecast: { cautious: last.low, realistic: last.base, optimistic: last.high },
+      project,
+      methodNote: confidence === 'low' ? 'Истории пока мало: это предварительная оценка. Чем больше регулярных записей, тем полезнее прогноз.' : confidence === 'medium' ? 'Есть первые закономерности. Прогноз полезен как ориентир, но нерегулярные поступления могут заметно изменить результат.' : 'Истории достаточно для базовой оценки привычного денежного потока. Неожиданные события всё равно могут изменить результат.'
+    };
+  }
+
+  function totalBalanceAt(date) {
+    const end = new Date(date); end.setHours(23, 59, 59, 999);
+    return state.wallets.reduce((value, wallet) => value + walletBalance(wallet.id, end.getTime()), 0);
+  }
+
+  function renderForecastChart(model) {
+    const historyCount = 21;
+    const history = Array.from({ length: historyCount + 1 }, (_, index) => {
+      const date = new Date(); date.setHours(0, 0, 0, 0); date.setDate(date.getDate() - (historyCount - index));
+      return { day: index - historyCount, value: totalBalanceAt(date) };
+    });
+    const points = model.project.map(point => ({ ...point, x: historyCount + point.day }));
+    const values = [...history.map(point => point.value), ...points.flatMap(point => [point.low, point.base, point.high])];
+    let min = Math.min(...values), max = Math.max(...values);
+    if (min === max) { min -= Math.max(10000, Math.abs(min) * 0.08); max += Math.max(10000, Math.abs(max) * 0.08); }
+    const pad = (max - min) * 0.12; min -= pad; max += pad;
+    const width = 860, height = 270, left = 72, right = 18, top = 18, bottom = 34;
+    const plotW = width - left - right, plotH = height - top - bottom;
+    const totalSteps = Math.max(1, historyCount + model.horizonDays);
+    const x = step => left + (step / totalSteps) * plotW;
+    const y = value => top + ((max - value) / (max - min)) * plotH;
+    const path = items => items.map((point, index) => `${index ? 'L' : 'M'}${x(point.x ?? (point.day + historyCount)).toFixed(1)},${y(point.value ?? point.base).toFixed(1)}`).join(' ');
+    const upper = points.map(point => ({ x: point.x, value: point.high }));
+    const lower = points.slice().reverse().map(point => ({ x: point.x, value: point.low }));
+    const area = upper.length ? `${path(upper)} ${lower.map(point => `L${x(point.x).toFixed(1)},${y(point.value).toFixed(1)}`).join(' ')} Z` : '';
+    const actual = path(history.map(point => ({ x: point.day + historyCount, value: point.value })));
+    const base = path(points.map(point => ({ x: point.x, value: point.base })));
+    const cautious = path(points.map(point => ({ x: point.x, value: point.low })));
+    const optimistic = path(points.map(point => ({ x: point.x, value: point.high })));
+    const grid = Array.from({ length: 5 }, (_, index) => {
+      const val = max - (max - min) * index / 4, yy = y(val);
+      return `<line x1="${left}" y1="${yy}" x2="${width - right}" y2="${yy}" class="forecast-grid-line"/><text x="${left - 10}" y="${yy + 4}" text-anchor="end" class="forecast-axis-label">${esc(shortMoney(val))}</text>`;
+    }).join('');
+    const nowX = x(historyCount);
+    const targetX = x(totalSteps);
+    const labels = `<text x="${left}" y="${height - 8}" class="forecast-axis-label">21 день назад</text><text x="${nowX}" y="${height - 8}" text-anchor="middle" class="forecast-axis-label">Сегодня</text><text x="${targetX}" y="${height - 8}" text-anchor="end" class="forecast-axis-label">${esc(new Date(model.target).toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }))}</text>`;
+    const futureBand = `<line x1="${nowX}" y1="${top}" x2="${nowX}" y2="${top + plotH}" class="forecast-now-line"/>`;
+    $('#forecastChart').innerHTML = `<svg class="forecast-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="График фактического баланса и трёх сценариев прогноза">${grid}${futureBand}${area ? `<path d="${area}" class="forecast-area"/>` : ''}<path d="${cautious}" class="forecast-line forecast-line-cautious"/><path d="${optimistic}" class="forecast-line forecast-line-optimistic"/><path d="${base}" class="forecast-line forecast-line-realistic"/><path d="${actual}" class="forecast-line forecast-line-actual"/><circle cx="${nowX}" cy="${y(model.current)}" r="5" class="forecast-current-dot"/><circle cx="${targetX}" cy="${y(model.forecast.realistic)}" r="5" class="forecast-end-dot"/>${labels}</svg>`;
+  }
+
+  function renderForecast() {
+    const input = $('#forecastDate'); if (!input) return;
+    const today = localDay(new Date());
+    const maxDate = new Date(today.getTime() + 365 * FORECAST_DAY_MS);
+    input.min = dateInputValue(today); input.max = dateInputValue(maxDate);
+    if (!input.value) { const initial = new Date(today.getTime() + 30 * FORECAST_DAY_MS); input.value = dateInputValue(initial); }
+    let picked = new Date(`${input.value}T00:00:00`);
+    if (Number.isNaN(picked.getTime())) return;
+    if (picked < today) { picked = today; input.value = dateInputValue(today); }
+    if (picked > maxDate) { picked = maxDate; input.value = dateInputValue(maxDate); }
+    const horizon = Math.max(0, Math.min(365, Math.ceil((localDay(picked).getTime() - today.getTime()) / FORECAST_DAY_MS)));
+    const model = buildForecastModel(horizon);
+    const confidenceLabels = { low: 'Мало истории', medium: 'Средняя уверенность', high: 'Хорошая история' };
+    const confidenceClass = model.confidence;
+    const delta = model.forecast.realistic - model.current;
+    const deltaMarkup = `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta))}`;
+    $('#forecastHero').innerHTML = `<section class="forecast-balance-card"><div class="forecast-balance-top"><span>ПРЕДПОЛАГАЕМЫЙ БАЛАНС</span><span class="forecast-confidence ${confidenceClass}"><i></i>${confidenceLabels[confidenceClass]}</span></div><div class="forecast-balance-main">${money(model.forecast.realistic)}</div><div class="forecast-target-label">${horizon === 0 ? 'Сегодня' : 'На ' + formatForecastDate(input.value)}</div><div class="forecast-balance-bottom"><div><small>Сейчас</small><strong>${money(model.current)}</strong></div><div><small>Изменение</small><strong class="${delta >= 0 ? 'positive' : 'negative'}">${deltaMarkup}</strong></div><div><small>Период</small><strong>${horizon} дн.</strong></div></div></section><div class="forecast-scenarios"><article class="forecast-scenario cautious"><small>ОСТОРОЖНЫЙ</small><strong>${money(model.forecast.cautious)}</strong><span>Расходы могут быть выше, доходы ниже</span></article><article class="forecast-scenario realistic"><small>РЕАЛИСТИЧНЫЙ</small><strong>${money(model.forecast.realistic)}</strong><span>Текущий денежный ритм сохранится</span></article><article class="forecast-scenario optimistic"><small>ОПТИМИСТИЧНЫЙ</small><strong>${money(model.forecast.optimistic)}</strong><span>Поступления выше, расходы ниже</span></article></div>`;
+    $('#forecastChartSubtitle').textContent = `От последних 21 дня до ${formatForecastDate(input.value)}`;
+    renderForecastChart(model);
+    const net30 = model.last30Income - model.last30Expense;
+    $('#forecastMetrics').innerHTML = `<article class="forecast-metric"><span>Поступления за последние 30 дней</span><strong class="positive">+${money(model.last30Income)}</strong></article><article class="forecast-metric"><span>Расходы за последние 30 дней</span><strong class="negative">−${money(model.last30Expense)}</strong></article><article class="forecast-metric"><span>Чистый поток за 30 дней</span><strong class="${net30 >= 0 ? 'positive' : 'negative'}">${net30 >= 0 ? '+' : '−'}${money(Math.abs(net30))}</strong></article><article class="forecast-metric"><span>Проанализировано</span><strong>${model.flowEntries} операций</strong><small>${model.historySpan} дней истории · ${model.activeDays} активных дней</small></article>`;
+    $('#forecastRecurring').innerHTML = model.patterns.length ? `<div class="forecast-recurring-summary">Найдено ${model.patterns.length} повторяющихся ${model.patterns.length === 1 ? 'шаблон' : 'шаблона'}.</div>${model.patterns.map(pattern => `<div class="forecast-recurring-item"><span class="forecast-recurring-icon ${pattern.type}">${pattern.type === 'income' ? '↙' : '↗'}</span><span class="forecast-recurring-text"><strong>${esc(pattern.description || pattern.category)}</strong><small>${esc(pattern.category)} · ${esc(pattern.cadenceLabel)}</small></span><strong class="${pattern.type === 'income' ? 'positive' : 'negative'}">${pattern.type === 'income' ? '+' : '−'}${money(pattern.amount)}</strong></div>`).join('')}` : `<div class="forecast-empty"><span>↻</span><strong>Пока нет устойчивых повторений</strong><small>Когда похожие операции начнут регулярно повторяться, приложение сможет учитывать их отдельно.</small></div>`;
+    const method = $('#forecastMethodNote'); if (method) method.textContent = model.methodNote;
+    const disclaimer = $('.forecast-disclaimer'); if (disclaimer) disclaimer.textContent = `${model.methodNote} Прогноз — ориентир, а не гарантия: новые поступления и незаписанные расходы изменят результат.`;
+    $$('[data-forecast-range]').forEach(button => button.classList.toggle('active', Number(button.dataset.forecastRange) === horizon));
   }
 
   function goalCurrent(goal) {
@@ -739,7 +926,9 @@
 
   function bindEvents() {
     document.addEventListener('click', event => {
+      const mobileMore = event.target.closest('[data-mobile-more]'); if (mobileMore) { $('#sidebar').classList.toggle('open'); return; }
       const nav = event.target.closest('[data-page]'); if (nav) { navigate(nav.dataset.page); return; }
+      const forecastRange = event.target.closest('[data-forecast-range]'); if (forecastRange) { const date = new Date(); date.setHours(0,0,0,0); date.setDate(date.getDate() + Number(forecastRange.dataset.forecastRange)); $('#forecastDate').value = dateInputValue(date); renderForecast(); return; }
       const goto = event.target.closest('[data-goto]'); if (goto) { navigate(goto.dataset.goto); return; }
       const action = event.target.closest('[data-action]'); if (action) { if (action.dataset.action === 'add') openTransactionModal(); if (action.dataset.action === 'add-goal') openGoalModal(); return; }
       const quickType = event.target.closest('[data-quick-type]'); if (quickType) { const type = quickType.dataset.quickType; if (type === 'transfer') { openTransactionModal({ type: 'transfer' }); return; } pendingQuickType = pendingQuickType === type ? null : type; updateQuickUi(); $('#quickInput').focus(); return; }
@@ -758,6 +947,8 @@
       if (event.target.closest('#newGoalBtn')) { openGoalModal(); return; }
     });
     $('#quickForm').addEventListener('submit', quickSubmit);
+    $('#mobileQuickAdd')?.addEventListener('click', () => { navigate('dashboard'); window.setTimeout(() => { const input = $('#quickInput'); input?.scrollIntoView({ behavior: 'smooth', block: 'center' }); input?.focus({ preventScroll: true }); }, 80); });
+    $('#forecastDate')?.addEventListener('change', renderForecast);
     $('#quickInput').addEventListener('input', () => { const val = $('#quickInput').value.trim(); if (val.startsWith('+')) $('#quickPrefix').textContent = '+'; else if (val.startsWith('-') || val.startsWith('−')) $('#quickPrefix').textContent = '−'; else if (/получ|доход|заработ/i.test(val)) $('#quickPrefix').textContent = '+'; else if (/потрат|расход|отдал|оплат|купил/i.test(val)) $('#quickPrefix').textContent = '−'; else updateQuickUi(); });
     $('#clearQuick').addEventListener('click', () => { $('#quickInput').value = ''; pendingQuickType = null; updateQuickUi(); $('#quickInput').focus(); });
     $('#voiceQuick').addEventListener('click', startVoiceInput);
@@ -788,7 +979,8 @@
       if (key === '/') { event.preventDefault(); navigate('transactions'); $('#historySearch').focus(); }
       if (key === '+') { pendingQuickType = 'income'; updateQuickUi(); navigate('dashboard'); $('#quickInput').focus(); }
       if (key === '-') { pendingQuickType = 'expense'; updateQuickUi(); navigate('dashboard'); $('#quickInput').focus(); }
-      if (/^[1-5]$/.test(key)) { const map = { '1': 'dashboard', '2': 'transactions', '3': 'wallets', '4': 'insights', '5': 'goals' }; navigate(map[key]); }
+      if (key === 'f') { navigate('forecast'); return; }
+      if (/^[1-6]$/.test(key)) { const map = { '1': 'dashboard', '2': 'transactions', '3': 'wallets', '4': 'insights', '5': 'goals', '6': 'forecast' }; navigate(map[key]); }
     });
     window.matchMedia?.('(prefers-color-scheme: light)').addEventListener?.('change', () => { if (state.settings.theme === 'system') applyTheme(); });
   }

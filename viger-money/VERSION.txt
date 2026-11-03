@@ -1,0 +1,3 @@
+VIGER MONEY 2.0
+Build: 2026-11-03
+Local-first; IndexedDB database name/schema intentionally preserved from v1.0.

@@ -31,3 +31,10 @@ VIGER MONEY — СТАРТ
 - Для синхронизации телефона и ПК настрой свой Supabase-проект по README.md и supabase-schema.sql.
 - Никогда не вставляй Supabase service_role key в клиентское приложение.
 - Прежде чем подключать уже заполненные данные с двух устройств, сохрани резервные копии и проверь названия кошельков.
+
+
+VIGER MONEY 2.0
+---------------
+This update adds a Money Forecast screen and a phone-first bottom bar. Export a JSON backup from your current version first. Then deploy the updated folder to the exact same website origin you already use; this keeps IndexedDB/localStorage under the same browser origin. Do not clear browser site data. After upload, reload the app; if installed as a PWA, close and reopen it once the update has been fetched.
+
+Forecast: choose a date or 7 / 30 / 90 / 180 days. The app uses recent income/expense records, ignores internal transfers, detects only consistent repeated transactions, and shows cautious, realistic and optimistic estimates. Forecasts are estimates, not guarantees.
