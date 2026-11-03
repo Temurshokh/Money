@@ -1,4 +1,4 @@
-# VIGER MONEY 2.0 — Personal Finance Web App
+# V Money 2.1.1 — Personal Finance Web App
 
 A responsive, local-first personal money ledger for desktop and mobile. The app is plain HTML/CSS/JavaScript and has no build step or runtime framework dependency.
 
@@ -30,6 +30,8 @@ Then open <http://localhost:8000> in your browser. `localhost` is treated as a s
 
 The app can often render when opening `index.html` directly, but service workers/PWA install behavior require HTTP(S); local file behavior for browser storage differs by browser. For proper testing use the local server.
 
+Forecast regression tests (Node.js): `node tests/forecast-model.test.cjs`.
+
 ## Set your starting balance
 
 Open **Кошельки** → edit a wallet → enter its **Начальный баланс**. This amount represents the money you already had before recording transactions; it is not counted as income. Alternatively, create a wallet with its initial balance. Start with a fresh backup after setting up your real accounts.
@@ -41,7 +43,7 @@ Cloud sync is not active until you configure your own Supabase project. The app 
 1. Create a Supabase project and open **SQL Editor**.
 2. Execute `supabase-schema.sql` in full. It creates the required tables and row-level security (RLS) rules.
 3. In Supabase project API settings, copy the **Project URL** and the client-side **publishable key** (or legacy `anon` key).
-4. In VIGER MONEY → Settings → Synchronization, paste the URL and key, enter an email and password, and select **Войти / создать аккаунт**.
+4. In V Money → Settings → Synchronization, paste the URL and key, enter an email and password, and select **Войти / создать аккаунт**.
 5. If Supabase email confirmation is enabled, confirm the account from the email before signing in. The app uses password auth and the authenticated user's session; it does not require a service key.
 6. Use **Синхронизировать** to manually start a sync. Signed-in sessions are also synced after local edits when online.
 
@@ -80,9 +82,9 @@ Shortcuts that could interfere with typing are disabled while a form field is fo
 
 ## Money Forecast Engine
 
-Open **Прогноз** and choose a date or a 7/30/90/180-day preset (the date picker allows up to one year). The calculation uses up to 90 days of income/expense history and excludes transfers between the user's own wallets. The baseline weights the last 30 observed days at 65% and the preceding observed period at 35%. Stable weekly, biweekly or monthly patterns are detected only when there are at least three similar transactions with sufficiently consistent dates and amounts; those entries are separated from the baseline and projected as future events. The result includes cautious, realistic and optimistic scenarios, with uncertainty widened according to observed weekly cash-flow variation.
+Open **Прогноз** and choose a target date or a 7/30/90/180-day preset (the date picker allows up to one year). The forecast uses recent completed calendar days, excludes transfers and wallet opening balances, and keeps one-time transactions in the actual balance while excluding them from the trend. Recognized recurring patterns and manually planned future events are projected separately.
 
-The app computes the forecast locally; no transaction history is sent to an AI service. Confidence is intentionally reduced when history is sparse. This is an estimate, not a guarantee: unrecorded purchases, irregular income and changes in habits affect the result. Keep recording transactions and retain backups.
+The calculation runs locally in the browser; transaction history is not sent to an AI service. Forecasts are estimates, not guarantees. Unrecorded purchases, irregular income and changes in habits affect the result. Keep recording transactions and retain backups.
 
 ### Updating an existing install
 
@@ -92,3 +94,27 @@ The app computes the forecast locally; no transaction history is sent to an AI s
 4. On a phone, close and reopen the installed PWA or reload the site after it has updated.
 
 Do not clear site data or browser storage during the update. The app does not have access to a user's live phone database from this ZIP; it updates the application code while preserving the existing same-origin storage.
+
+
+## Forecast 2.1.1
+
+The core forecast baseline is the **last seven completed calendar days**. It no longer divides the lifetime net balance by the number of days since the first transaction. The current partial day is excluded. If the app has 3–6 available completed days, their average daily flow is normalized to a week. With fewer than three days, the short observed net amount is not multiplied by 7 / observed-days; confidence stays low, and a very short sample is not presented as a reliable daily income rate.
+
+Transactions have a forecast setting: **Обычная** (included in the recent cash-flow trend) or **Разовая** (still included in the real balance and history, but excluded from trend and recurring-pattern detection). Existing transactions without this field remain **Обычными** by default. Transfers and opening wallet balances are not income or expense.
+
+Recognized recurring operations are separated from the recent baseline and projected on their expected dates, preventing their historical occurrences from being counted twice. Scenario sensitivity is bounded: cautious uses income −15% and expenses +15%; optimistic uses income +15% and expenses −15%. With very little history, confidence stays low and the forecast avoids inventing a daily income.
+
+Known future income or expenses can be added under **Прогноз → Планируемые поступления и расходы**. These planned events affect forecast values only; they do not change the actual wallet balance or transaction history.
+
+### Updating an existing install
+
+1. Export a JSON backup from the old version first.
+2. Deploy the full release folder to the **same HTTPS origin/domain** as before. Do not change between `www` and non-`www` or move to a different hosting URL unless you export and restore the backup.
+3. Keep the existing browser data. The IndexedDB database remains `viger-money-db`, schema version `1`, key `main-state`; these legacy storage identifiers are intentionally preserved to protect existing V Money data.
+4. The service-worker cache is bumped to `v-money-v2.1.1`. Reload the site; on the phone, close and reopen the installed PWA if the new shell does not appear.
+
+Do not clear site data or delete IndexedDB during the update. The ZIP changes the application files; it does not directly replace your published website.
+
+### Supabase schema update
+
+If cloud sync is configured, run the updated `supabase-schema.sql` once in the project's SQL Editor. It adds the `forecast_mode` column to transactions and creates the `planned_events` table with per-user RLS policies. Local-only installations do not need this step.

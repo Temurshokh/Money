@@ -1,8 +1,8 @@
 {
   "id": ".",
-  "name": "VIGER MONEY 2.0 — личный финансовый журнал",
-  "short_name": "VIGER MONEY",
-  "description": "Быстрый учёт денег, прогноз баланса и личная финансовая аналитика.",
+  "name": "V Money 2.1.1 — личный финансовый журнал",
+  "short_name": "V Money",
+  "description": "Быстрый учёт денег, прогноз баланса и финансовые планы.",
   "lang": "ru",
   "start_url": "./index.html",
   "scope": "./",
@@ -11,8 +11,23 @@
   "background_color": "#0d100e",
   "theme_color": "#101310",
   "icons": [
-    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" },
-    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
   ]
 }

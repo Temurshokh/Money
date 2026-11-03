@@ -1,4 +1,4 @@
--- VIGER MONEY: схема облачной синхронизации
+-- V Money: схема облачной синхронизации
 -- Выполни целиком в Supabase → SQL Editor → New query.
 -- Клиент использует только publishable/anon key. Никогда не вставляй service_role key во frontend.
 
@@ -24,6 +24,7 @@ create table if not exists public.transactions (
   to_wallet_id uuid references public.wallets(id) on delete restrict,
   description text not null default '',
   category text not null default 'Прочее',
+  forecast_mode text not null default 'normal',
   occurred_at timestamptz not null default now(),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -34,8 +35,24 @@ create table if not exists public.transactions (
   )
 );
 
+alter table public.transactions add column if not exists forecast_mode text not null default 'normal';
+
 create index if not exists transactions_user_occurred_idx on public.transactions(user_id, occurred_at desc);
 create index if not exists transactions_user_updated_idx on public.transactions(user_id, updated_at desc);
+
+create table if not exists public.planned_events (
+  id uuid primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  type text not null check (type in ('income','expense')),
+  amount bigint not null check (amount > 0),
+  event_date date not null,
+  description text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  deleted_at timestamptz
+);
+
+create index if not exists planned_events_user_date_idx on public.planned_events(user_id, event_date);
 
 create table if not exists public.goals (
   id uuid primary key,
@@ -65,6 +82,7 @@ create table if not exists public.audit_log (
 alter table public.wallets enable row level security;
 alter table public.transactions enable row level security;
 alter table public.goals enable row level security;
+alter table public.planned_events enable row level security;
 alter table public.audit_log enable row level security;
 
 -- Политики изолируют данные каждого аккаунта. Клиент не может читать чужие строки.
@@ -93,6 +111,16 @@ create policy "transactions update own" on public.transactions for update to aut
 );
 drop policy if exists "transactions delete own" on public.transactions;
 create policy "transactions delete own" on public.transactions for delete to authenticated using (user_id = auth.uid());
+
+
+drop policy if exists "planned_events select own" on public.planned_events;
+create policy "planned_events select own" on public.planned_events for select to authenticated using (user_id = auth.uid());
+drop policy if exists "planned_events insert own" on public.planned_events;
+create policy "planned_events insert own" on public.planned_events for insert to authenticated with check (user_id = auth.uid());
+drop policy if exists "planned_events update own" on public.planned_events;
+create policy "planned_events update own" on public.planned_events for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
+drop policy if exists "planned_events delete own" on public.planned_events;
+create policy "planned_events delete own" on public.planned_events for delete to authenticated using (user_id = auth.uid());
 
 drop policy if exists "goals select own" on public.goals;
 create policy "goals select own" on public.goals for select to authenticated using (user_id = auth.uid());

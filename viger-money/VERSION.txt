@@ -1,3 +1,4 @@
-VIGER MONEY 2.0
+V Money 2.1.1
 Build: 2026-11-03
-Local-first; IndexedDB database name/schema intentionally preserved from v1.0.
+Forecast patch: rolling completed-week cash flow, one-time transaction marking, planned future events.
+Local database identity preserved for existing installs.

@@ -57,7 +57,7 @@
         { id: uid(), name: 'Карта', kind: 'card', icon: '▰', accent: '#95c7ef', initialBalance: 0, createdAt: stamp, updatedAt: stamp, archivedAt: null },
         { id: uid(), name: 'Накопления', kind: 'savings', icon: '▣', accent: '#d0a7e8', initialBalance: 0, createdAt: stamp, updatedAt: stamp, archivedAt: null }
       ],
-      transactions: [], goals: [], audit: [], undoStack: [], createdAt: stamp, updatedAt: stamp
+      transactions: [], goals: [], plannedEvents: [], audit: [], undoStack: [], createdAt: stamp, updatedAt: stamp
     };
   };
 
@@ -391,60 +391,101 @@
     const historyStart = new Date(today.getTime() - 89 * FORECAST_DAY_MS);
     const historyTransactions = activeTransactions().filter(tx => {
       const time = new Date(tx.occurredAt).getTime();
-      return (tx.type === 'income' || tx.type === 'expense') && time >= historyStart.getTime() && time <= now.getTime();
+      return (tx.type === 'income' || tx.type === 'expense') && Number.isFinite(time) && time >= historyStart.getTime() && time < today.getTime();
     });
-    const patterns = detectRecurringPatterns(historyTransactions, today, target);
+    const forecastEligible = historyTransactions.filter(tx => tx.forecastMode !== 'one-time');
+    const recurringHorizon = new Date(today.getTime() + 365 * FORECAST_DAY_MS);
+    const patterns = detectRecurringPatterns(forecastEligible, today, recurringHorizon);
     const recurringIds = new Set(patterns.flatMap(pattern => pattern.ids));
-    const residualDaily = Array(90).fill(0);
-    const incomeDaily = Array(90).fill(0);
-    const expenseDaily = Array(90).fill(0);
-    for (const tx of historyTransactions) {
-      const dayIndex = Math.floor((localDay(tx.occurredAt).getTime() - historyStart.getTime()) / FORECAST_DAY_MS);
-      if (dayIndex < 0 || dayIndex >= 90) continue;
-      const signed = (tx.type === 'income' ? 1 : -1) * (Number(tx.amount) || 0);
-      if (tx.type === 'income') incomeDaily[dayIndex] += Number(tx.amount) || 0;
-      else expenseDaily[dayIndex] += Number(tx.amount) || 0;
-      if (!recurringIds.has(tx.id)) residualDaily[dayIndex] += signed;
-    }
+
+    // Use the last seven COMPLETE calendar days. The current day is not complete yet,
+    // so today's partial activity cannot distort the weekly pace.
+    const weekStart = new Date(today.getTime() - 7 * FORECAST_DAY_MS);
+    const earliestHistoryDay = historyTransactions.length
+      ? new Date(Math.min(...historyTransactions.map(tx => localDay(tx.occurredAt).getTime())))
+      : today;
+    const observedStart = new Date(Math.max(weekStart.getTime(), earliestHistoryDay.getTime()));
+    const observedDays = Math.max(0, Math.min(7, Math.round((today.getTime() - observedStart.getTime()) / FORECAST_DAY_MS)));
+    const recentTransactions = forecastEligible.filter(tx => {
+      const day = localDay(tx.occurredAt).getTime();
+      return day >= weekStart.getTime() && day < today.getTime() && !recurringIds.has(tx.id);
+    });
+    const recentIncomeRaw = sum(recentTransactions.filter(tx => tx.type === 'income').map(tx => Number(tx.amount) || 0));
+    const recentExpenseRaw = sum(recentTransactions.filter(tx => tx.type === 'expense').map(tx => Number(tx.amount) || 0));
+
+    // With 3–6 complete days, scale the observed daily average to a week.
+    // With only 1–2 days, do not extrapolate a possibly exceptional deposit across seven days.
+    const weeklyScale = observedDays >= 3 ? 7 / observedDays : 1;
+    const weeklyIncome = recentIncomeRaw * weeklyScale;
+    const weeklyExpense = recentExpenseRaw * weeklyScale;
+    const weeklyNet = weeklyIncome - weeklyExpense;
+
     const flowEntries = historyTransactions.length;
     const activeDays = new Set(historyTransactions.map(tx => dateInputValue(tx.occurredAt))).size;
+    const trendEntries = forecastEligible.length;
+    const trendActiveDays = new Set(forecastEligible.map(tx => dateInputValue(tx.occurredAt))).size;
     const earliest = historyTransactions.length ? Math.min(...historyTransactions.map(tx => localDay(tx.occurredAt).getTime())) : today.getTime();
     const historySpan = historyTransactions.length ? Math.min(90, Math.floor((today.getTime() - earliest) / FORECAST_DAY_MS) + 1) : 0;
-    const daysObserved = historySpan;
-    const recentCount = Math.min(30, daysObserved);
-    const previousCount = Math.min(60, Math.max(0, daysObserved - recentCount));
-    const recent = recentCount ? residualDaily.slice(90 - recentCount) : [];
-    const previous = previousCount ? residualDaily.slice(90 - recentCount - previousCount, 90 - recentCount) : [];
-    const recentDaily = average(recent);
-    const previousDaily = average(previous);
-    const baseDaily = previous.length ? recentDaily * 0.65 + previousDaily * 0.35 : recentDaily;
-    const observedResidual = daysObserved ? residualDaily.slice(90 - daysObserved) : [];
-    const weeklyResidual = [];
-    for (let i = 0; i < observedResidual.length; i += 7) { const week = observedResidual.slice(i, i + 7); weeklyResidual.push(sum(week) / Math.max(1, week.length) * 7); }
-    const weeklySpread = standardDeviation(weeklyResidual.slice(-10));
     let confidence = 'low';
-    if (historySpan >= 60 && flowEntries >= 25 && activeDays >= 16) confidence = 'high';
-    else if (historySpan >= 30 && flowEntries >= 8 && activeDays >= 5) confidence = 'medium';
+    if (observedDays >= 7 && historySpan >= 60 && trendEntries >= 25 && trendActiveDays >= 16) confidence = 'high';
+    else if (observedDays >= 7 && historySpan >= 14 && trendEntries >= 8 && trendActiveDays >= 5) confidence = 'medium';
+
     const current = totalBalance();
-    const events = patterns.flatMap(pattern => pattern.events);
+    const plannedEvents = (state.plannedEvents || []).filter(event => {
+      if (event.deletedAt || !event.date || !['income', 'expense'].includes(event.type)) return false;
+      const date = new Date(`${event.date}T12:00:00`);
+      return Number.isFinite(date.getTime()) && date >= today && date <= target && Number(event.amount) > 0;
+    }).map(event => ({
+      ...event,
+      day: Math.max(0, Math.round((localDay(new Date(`${event.date}T12:00:00`)).getTime() - today.getTime()) / FORECAST_DAY_MS))
+    }));
+    const recurringEvents = patterns.flatMap(pattern => pattern.events)
+      .filter(event => event.day >= 0 && event.day <= horizonDays);
     const project = [];
+    let recurringBaseCumulative = 0, recurringLowCumulative = 0, recurringHighCumulative = 0, plannedCumulative = 0;
     for (let day = 0; day <= horizonDays; day++) {
-      const dueEvents = events.filter(event => event.day === day);
-      const center = current + baseDaily * day + sum(dueEvents.map(event => (event.type === 'income' ? 1 : -1) * event.amount));
-      const lowEvents = sum(dueEvents.map(event => event.type === 'income' ? event.amount * 0.85 : -event.amount * 1.15));
-      const highEvents = sum(dueEvents.map(event => event.type === 'income' ? event.amount * 1.15 : -event.amount * 0.85));
-      const uncertainty = weeklySpread * Math.sqrt(Math.max(0, day / 7));
-      project.push({ day, base: center, low: current + baseDaily * day + lowEvents - uncertainty, high: current + baseDaily * day + highEvents + uncertainty });
+      const dueRecurring = recurringEvents.filter(event => event.day === day);
+      const duePlanned = plannedEvents.filter(event => event.day === day);
+      recurringBaseCumulative += sum(dueRecurring.map(event => (event.type === 'income' ? 1 : -1) * event.amount));
+      recurringLowCumulative += sum(dueRecurring.map(event => event.type === 'income' ? event.amount * 0.9 : -event.amount * 1.1));
+      recurringHighCumulative += sum(dueRecurring.map(event => event.type === 'income' ? event.amount * 1.1 : -event.amount * 0.9));
+      plannedCumulative += sum(duePlanned.map(event => (event.type === 'income' ? 1 : -1) * Number(event.amount)));
+      const baselineReal = weeklyNet * (day / 7);
+      const baselineLow = (weeklyIncome * 0.85 - weeklyExpense * 1.15) * (day / 7);
+      const baselineHigh = (weeklyIncome * 1.15 - weeklyExpense * 0.85) * (day / 7);
+      project.push({
+        day,
+        base: current + baselineReal + recurringBaseCumulative + plannedCumulative,
+        low: current + baselineLow + recurringLowCumulative + plannedCumulative,
+        high: current + baselineHigh + recurringHighCumulative + plannedCumulative
+      });
     }
     const last = project[project.length - 1] || { base: current, low: current, high: current };
-    const last30Income = sum(incomeDaily.slice(-30));
-    const last30Expense = sum(expenseDaily.slice(-30));
+    const last30Start = new Date(today.getTime() - 30 * FORECAST_DAY_MS);
+    const last30Transactions = historyTransactions.filter(tx => new Date(tx.occurredAt).getTime() >= last30Start.getTime());
+    const last30Income = sum(last30Transactions.filter(tx => tx.type === 'income').map(tx => Number(tx.amount) || 0));
+    const last30Expense = sum(last30Transactions.filter(tx => tx.type === 'expense').map(tx => Number(tx.amount) || 0));
+    const oneTimeExcluded = historyTransactions.filter(tx => tx.forecastMode === 'one-time').length;
+    const upcomingPlanned = plannedEvents.length;
+    let methodNote;
+    if (!observedDays) {
+      methodNote = 'За последние завершённые дни пока нет истории. Прогноз не придумывает ежедневный доход: учитываются только запланированные события и подтверждённые повторения.';
+    } else if (observedDays < 3) {
+      methodNote = `Есть только ${observedDays} ${observedDays === 1 ? 'завершённый день' : 'завершённых дня'} наблюдений. Мы не растягиваем такой короткий отрезок на неделю, чтобы одна крупная операция не создала ложный прогноз.`;
+    } else if (observedDays < 7) {
+      methodNote = `Учтено ${observedDays} доступных завершённых дней; их средний дневной поток пересчитан на неделю. Для полной недели пока мало данных.`;
+    } else {
+      methodNote = `Основа прогноза — чистый денежный поток последних 7 завершённых календарных дней: ${weeklyNet >= 0 ? '+' : '−'}${money(Math.abs(weeklyNet))} за неделю. Старые крупные поступления за пределами этой недели не повторяются.`;
+    }
+    if (oneTimeExcluded) methodNote += ` Исключено разовых операций из истории: ${oneTimeExcluded}.`;
+    if (patterns.length) methodNote += ` Отдельно учтено повторяющихся шаблонов: ${patterns.length}.`;
+    if (upcomingPlanned) methodNote += ` Запланированных событий: ${upcomingPlanned}.`;
     return {
-      current, horizonDays, target, baseDaily, weeklySpread, confidence, historySpan, flowEntries, activeDays,
-      patterns, events, last30Income, last30Expense,
+      current, horizonDays, target, weeklyIncome, weeklyExpense, weeklyNet, weeklyScale, observedDays,
+      confidence, historySpan, flowEntries, activeDays, patterns, plannedEvents, recurringEvents,
+      last30Income, last30Expense, oneTimeExcluded,
       forecast: { cautious: last.low, realistic: last.base, optimistic: last.high },
-      project,
-      methodNote: confidence === 'low' ? 'Истории пока мало: это предварительная оценка. Чем больше регулярных записей, тем полезнее прогноз.' : confidence === 'medium' ? 'Есть первые закономерности. Прогноз полезен как ориентир, но нерегулярные поступления могут заметно изменить результат.' : 'Истории достаточно для базовой оценки привычного денежного потока. Неожиданные события всё равно могут изменить результат.'
+      project, methodNote
     };
   }
 
@@ -501,18 +542,51 @@
     const horizon = Math.max(0, Math.min(365, Math.ceil((localDay(picked).getTime() - today.getTime()) / FORECAST_DAY_MS)));
     const model = buildForecastModel(horizon);
     const confidenceLabels = { low: 'Мало истории', medium: 'Средняя уверенность', high: 'Хорошая история' };
-    const confidenceClass = model.confidence;
     const delta = model.forecast.realistic - model.current;
     const deltaMarkup = `${delta >= 0 ? '+' : '−'}${money(Math.abs(delta))}`;
-    $('#forecastHero').innerHTML = `<section class="forecast-balance-card"><div class="forecast-balance-top"><span>ПРЕДПОЛАГАЕМЫЙ БАЛАНС</span><span class="forecast-confidence ${confidenceClass}"><i></i>${confidenceLabels[confidenceClass]}</span></div><div class="forecast-balance-main">${money(model.forecast.realistic)}</div><div class="forecast-target-label">${horizon === 0 ? 'Сегодня' : 'На ' + formatForecastDate(input.value)}</div><div class="forecast-balance-bottom"><div><small>Сейчас</small><strong>${money(model.current)}</strong></div><div><small>Изменение</small><strong class="${delta >= 0 ? 'positive' : 'negative'}">${deltaMarkup}</strong></div><div><small>Период</small><strong>${horizon} дн.</strong></div></div></section><div class="forecast-scenarios"><article class="forecast-scenario cautious"><small>ОСТОРОЖНЫЙ</small><strong>${money(model.forecast.cautious)}</strong><span>Расходы могут быть выше, доходы ниже</span></article><article class="forecast-scenario realistic"><small>РЕАЛИСТИЧНЫЙ</small><strong>${money(model.forecast.realistic)}</strong><span>Текущий денежный ритм сохранится</span></article><article class="forecast-scenario optimistic"><small>ОПТИМИСТИЧНЫЙ</small><strong>${money(model.forecast.optimistic)}</strong><span>Поступления выше, расходы ниже</span></article></div>`;
-    $('#forecastChartSubtitle').textContent = `От последних 21 дня до ${formatForecastDate(input.value)}`;
+    $('#forecastHero').innerHTML = `<section class="forecast-balance-card"><div class="forecast-balance-top"><span>ПРЕДПОЛАГАЕМЫЙ БАЛАНС</span><span class="forecast-confidence ${model.confidence}"><i></i>${confidenceLabels[model.confidence]}</span></div><div class="forecast-balance-main">${money(model.forecast.realistic)}</div><div class="forecast-target-label">На ${formatForecastDate(input.value)}</div><div class="forecast-balance-bottom"><div><small>Сейчас</small><strong>${money(model.current)}</strong></div><div><small>Изменение</small><strong class="${delta >= 0 ? 'positive' : 'negative'}">${deltaMarkup}</strong></div><div><small>Период</small><strong>${horizon} дн.</strong></div></div></section><div class="forecast-scenarios"><article class="forecast-scenario cautious"><small>ОСТОРОЖНЫЙ</small><strong>${money(model.forecast.cautious)}</strong><span>Доходы −15%, расходы +15%</span></article><article class="forecast-scenario realistic"><small>РЕАЛИСТИЧНЫЙ</small><strong>${money(model.forecast.realistic)}</strong><span>Последний недельный ритм</span></article><article class="forecast-scenario optimistic"><small>ОПТИМИСТИЧНЫЙ</small><strong>${money(model.forecast.optimistic)}</strong><span>Доходы +15%, расходы −15%</span></article></div>`;
+    $('#forecastChartSubtitle').textContent = `Последние 21 день и прогноз до ${formatForecastDate(input.value)}`;
     renderForecastChart(model);
     const net30 = model.last30Income - model.last30Expense;
-    $('#forecastMetrics').innerHTML = `<article class="forecast-metric"><span>Поступления за последние 30 дней</span><strong class="positive">+${money(model.last30Income)}</strong></article><article class="forecast-metric"><span>Расходы за последние 30 дней</span><strong class="negative">−${money(model.last30Expense)}</strong></article><article class="forecast-metric"><span>Чистый поток за 30 дней</span><strong class="${net30 >= 0 ? 'positive' : 'negative'}">${net30 >= 0 ? '+' : '−'}${money(Math.abs(net30))}</strong></article><article class="forecast-metric"><span>Проанализировано</span><strong>${model.flowEntries} операций</strong><small>${model.historySpan} дней истории · ${model.activeDays} активных дней</small></article>`;
-    $('#forecastRecurring').innerHTML = model.patterns.length ? `<div class="forecast-recurring-summary">Найдено ${model.patterns.length} повторяющихся ${model.patterns.length === 1 ? 'шаблон' : 'шаблона'}.</div>${model.patterns.map(pattern => `<div class="forecast-recurring-item"><span class="forecast-recurring-icon ${pattern.type}">${pattern.type === 'income' ? '↙' : '↗'}</span><span class="forecast-recurring-text"><strong>${esc(pattern.description || pattern.category)}</strong><small>${esc(pattern.category)} · ${esc(pattern.cadenceLabel)}</small></span><strong class="${pattern.type === 'income' ? 'positive' : 'negative'}">${pattern.type === 'income' ? '+' : '−'}${money(pattern.amount)}</strong></div>`).join('')}` : `<div class="forecast-empty"><span>↻</span><strong>Пока нет устойчивых повторений</strong><small>Когда похожие операции начнут регулярно повторяться, приложение сможет учитывать их отдельно.</small></div>`;
+    $('#forecastMetrics').innerHTML = `<article class="forecast-metric"><span>Доходы за последние 30 дней</span><strong class="positive">+${money(model.last30Income)}</strong></article><article class="forecast-metric"><span>Расходы за последние 30 дней</span><strong class="negative">−${money(model.last30Expense)}</strong></article><article class="forecast-metric"><span>Поток за последнюю неделю*</span><strong class="${model.weeklyNet >= 0 ? 'positive' : 'negative'}">${model.weeklyNet >= 0 ? '+' : '−'}${money(Math.abs(model.weeklyNet))}</strong><small>${model.observedDays} завершённых дней · без разовых и повторяющихся записей</small></article><article class="forecast-metric"><span>История</span><strong>${model.flowEntries} операций</strong><small>${model.historySpan} дней · ${model.activeDays} активных дней</small></article>`;
+    $('#forecastRecurring').innerHTML = model.patterns.length ? `<div class="forecast-recurring-summary">Найдено ${model.patterns.length} повторяющихся ${model.patterns.length === 1 ? 'шаблон' : 'шаблона'}.</div>${model.patterns.map(pattern => `<div class="forecast-recurring-item"><span class="forecast-recurring-icon ${pattern.type}">${pattern.type === 'income' ? '↙' : '↗'}</span><span class="forecast-recurring-text"><strong>${esc(pattern.description || pattern.category)}</strong><small>${esc(pattern.category)} · ${esc(pattern.cadenceLabel)}</small></span><strong class="${pattern.type === 'income' ? 'positive' : 'negative'}">${pattern.type === 'income' ? '+' : '−'}${money(pattern.amount)}</strong></div>`).join('')}` : `<div class="forecast-empty"><span>↻</span><strong>Пока нет устойчивых повторений</strong><small>Повторяющиеся операции будут учтены отдельно после нескольких стабильных повторов.</small></div>`;
+    const plans = (state.plannedEvents || []).filter(event => !event.deletedAt && event.date >= dateInputValue(new Date())).sort((a,b) => a.date.localeCompare(b.date));
+    $('#forecastPlans').innerHTML = plans.length ? plans.map(event => `<div class="forecast-plan-row"><span class="forecast-plan-sign ${event.type}">${event.type === 'income' ? '+' : '−'}</span><span class="forecast-plan-main"><strong>${esc(event.description || (event.type === 'income' ? 'Поступление' : 'Расход'))}</strong><small>${esc(new Date(`${event.date}T12:00:00`).toLocaleDateString('ru-RU', { day:'numeric', month:'long', year:'numeric' }))}</small></span><strong class="${event.type === 'income' ? 'positive' : 'negative'}">${event.type === 'income' ? '+' : '−'}${money(event.amount)}</strong><span class="forecast-plan-actions"><button type="button" data-edit-plan="${event.id}" aria-label="Изменить событие">✎</button><button type="button" data-delete-plan="${event.id}" aria-label="Удалить событие">×</button></span></div>`).join('') : `<div class="forecast-empty"><span>＋</span><strong>Пока ничего не запланировано</strong><small>Добавь известное поступление или расход — прогноз учтёт его отдельно от привычного темпа.</small></div>`;
     const method = $('#forecastMethodNote'); if (method) method.textContent = model.methodNote;
-    const disclaimer = $('.forecast-disclaimer'); if (disclaimer) disclaimer.textContent = `${model.methodNote} Прогноз — ориентир, а не гарантия: новые поступления и незаписанные расходы изменят результат.`;
+    const disclaimer = $('.forecast-disclaimer'); if (disclaimer) disclaimer.textContent = `${model.methodNote} *Последняя неделя — семь завершённых календарных дней. Если истории меньше трёх дней, приложение не экстраполирует её на неделю. Разовые операции исключаются из будущего темпа, но остаются в фактическом балансе. Прогноз — ориентир, а не гарантия.`;
     $$('[data-forecast-range]').forEach(button => button.classList.toggle('active', Number(button.dataset.forecastRange) === horizon));
+  }
+
+  function openPlannedEventModal(event = null) {
+    const editing = !!event;
+    const todayValue = dateInputValue(new Date());
+    openModal(editing ? 'Изменить событие' : 'Запланировать деньги', editing ? 'БУДУЩЕЕ СОБЫТИЕ' : 'ДОБАВИТЬ В ПРОГНОЗ', `<form id="plannedEventForm" class="modal-form"><div class="modal-type-select"><button type="button" class="modal-type-option ${!event || event.type === 'income' ? 'active' : ''}" data-plan-type="income">＋ Поступление</button><button type="button" class="modal-type-option ${event?.type === 'expense' ? 'active' : ''}" data-plan-type="expense">− Расход</button></div><input type="hidden" id="planType" value="${event?.type || 'income'}"/><div class="field"><label for="planAmount">Сумма, сум</label><input id="planAmount" type="number" min="1" step="1" required inputmode="numeric" placeholder="100000" value="${event?.amount ?? ''}"/></div><div class="field"><label for="planDate">Ожидаемая дата</label><input id="planDate" type="date" min="${todayValue}" required value="${event?.date || todayValue}"/></div><div class="field"><label for="planDescription">Описание</label><input id="planDescription" maxlength="100" placeholder="Например, карманные деньги" value="${esc(event?.description || '')}"/></div><p class="modal-footnote">Это не реальная операция: событие не изменит текущий баланс и будет учтено только в прогнозе.</p><div class="modal-actions"><button type="button" class="secondary-btn" id="cancelPlan">Отмена</button><button type="submit" class="primary-btn">${editing ? 'Сохранить' : 'Добавить в прогноз'} ↗</button></div></form>`);
+    $('#cancelPlan').addEventListener('click', closeModal);
+    $$('[data-plan-type]').forEach(button => button.addEventListener('click', () => {
+      $('#planType').value = button.dataset.planType;
+      $$('[data-plan-type]').forEach(item => item.classList.toggle('active', item === button));
+    }));
+    $('#plannedEventForm').addEventListener('submit', eventSubmit => {
+      eventSubmit.preventDefault();
+      const amount = Number($('#planAmount').value), date = $('#planDate').value, type = $('#planType').value;
+      if (!Number.isSafeInteger(amount) || amount <= 0) return toast('Введи корректную сумму', 'error');
+      if (!date || date < todayValue || !['income','expense'].includes(type)) return toast('Выбери сегодняшнюю или будущую дату', 'error');
+      const stamp = nowISO();
+      const data = { type, amount, date, description: $('#planDescription').value.trim(), updatedAt: stamp, deletedAt: null };
+      if (event) {
+        const before = clone(event); Object.assign(event, data); audit('update', 'plannedEvent', event.id, before, event); toast('Событие обновлено');
+      } else {
+        const created = { id: uid(), ...data, createdAt: stamp }; state.plannedEvents.push(created); audit('create', 'plannedEvent', created.id, null, created); toast('Событие добавлено в прогноз');
+      }
+      persist(); closeModal();
+    });
+  }
+  function deletePlannedEvent(id) {
+    const event = (state.plannedEvents || []).find(item => item.id === id && !item.deletedAt);
+    if (!event) return;
+    confirmAction('Удалить запланированное событие?', `«${event.description || (event.type === 'income' ? 'Поступление' : 'Расход')}» на ${money(event.amount)} исчезнет из прогноза. Фактический баланс не изменится.`, () => {
+      const before = clone(event); event.deletedAt = nowISO(); event.updatedAt = nowISO(); audit('delete', 'plannedEvent', id, before, event); persist(); toast('Событие удалено из прогноза');
+    }, 'Удалить');
   }
 
   function goalCurrent(goal) {
@@ -645,7 +719,7 @@
         <div class="field"><label for="txAmount">Сумма</label><div class="modal-amount-input"><input id="txAmount" type="number" min="1" step="1" required placeholder="0" value="${values.amount != null ? esc(values.amount) : ''}"/><span>сум</span></div></div>
         <div class="field"><label for="txDescription">Описание</label><input id="txDescription" maxlength="120" placeholder="Например, карманные деньги" value="${esc(values.description || '')}"/></div>
         <div class="modal-form-grid"><div class="field" id="txWalletField"><label for="txWallet">${type === 'income' ? 'Куда поступили' : 'Из какого кошелька'}</label><select id="txWallet" required>${walletOptions}</select></div><div class="field ${type === 'transfer' ? '' : 'hidden'}" id="txToWalletField"><label for="txToWallet">Куда перевести</label><select id="txToWallet" ${type === 'transfer' ? 'required' : ''}>${toOptions}</select></div><div class="field ${type === 'transfer' ? 'hidden' : ''}" id="txCategoryField"><label for="txCategory">Категория</label><select id="txCategory">${cats.map(c => `<option ${c === (values.category || (type === 'income' ? 'Доход' : 'Прочее')) ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></div></div>
-        <div class="field"><label for="txDate">Дата и время</label><input id="txDate" type="datetime-local" required value="${localDateTimeValue(current)}"/></div>
+        <div class="field"><label for="txDate">Дата и время</label><input id="txDate" type="datetime-local" required value="${localDateTimeValue(current)}"/></div><div class="field" id="txForecastModeField"><label for="txForecastMode">Учитывать в прогнозе</label><select id="txForecastMode"><option value="normal" ${(values.forecastMode || 'normal') === 'normal' ? 'selected' : ''}>Обычная операция — учитывать в темпе</option><option value="one-time" ${values.forecastMode === 'one-time' ? 'selected' : ''}>Разовая — не повторять в будущем</option></select><small class="modal-footnote">Разовые крупные поступления или покупки меняют фактический баланс, но не будут повторяться в прогнозе.</small></div>
         ${values.warning ? `<div class="confirm-card">ⓘ ${esc(values.warning)}</div>` : ''}
         <div class="modal-actions"><button type="button" class="secondary-btn" id="cancelTransaction">Отмена</button><button type="submit" class="primary-btn">${isEdit ? 'Сохранить изменения' : 'Сохранить операцию'} ↗</button></div>
         <p class="modal-footnote">Операция сохраняется локально. Баланс и статистика пересчитаются автоматически.</p>
@@ -656,7 +730,7 @@
       $$('.modal-type-option').forEach(btn => btn.classList.toggle('active', btn.dataset.modalType === nextType));
       $('#txToWalletField').classList.toggle('hidden', nextType !== 'transfer'); $('#txCategoryField').classList.toggle('hidden', nextType === 'transfer');
       $('#txWalletField label').textContent = nextType === 'income' ? 'Куда поступили' : nextType === 'transfer' ? 'Откуда' : 'Из какого кошелька';
-      $('#txToWallet').required = nextType === 'transfer'; $('#txCategory').disabled = nextType === 'transfer';
+      $('#txToWallet').required = nextType === 'transfer'; $('#txCategory').disabled = nextType === 'transfer'; $('#txForecastModeField').classList.toggle('hidden', nextType === 'transfer');
     }
     $$('.modal-type-option').forEach(btn => btn.addEventListener('click', () => switchType(btn.dataset.modalType)));
     $('#txWallet').addEventListener('change', () => { const from = $('#txWallet').value; const selected = $('#txToWallet').value; $('#txToWallet').innerHTML = wallets.filter(w => w.id !== from).map(w => `<option value="${w.id}" ${w.id === selected ? 'selected' : ''}>${esc(w.name)}</option>`).join(''); if (!wallets.some(w => w.id === selected && w.id !== from)) $('#txToWallet').selectedIndex = 0; });
@@ -668,7 +742,7 @@
       if (!walletId || !findWallet(walletId)) { toast('Выбери существующий кошелёк', 'error'); return; }
       if (txType === 'transfer' && (!toWalletId || toWalletId === walletId)) { toast('Для перевода выбери два разных кошелька', 'error'); return; }
       const occurredAt = new Date($('#txDate').value).toISOString();
-      const data = { type: txType, amount, walletId, toWalletId: txType === 'transfer' ? toWalletId : null, description: $('#txDescription').value.trim(), category: txType === 'transfer' ? 'Перевод' : $('#txCategory').value, occurredAt };
+      const data = { type: txType, amount, walletId, toWalletId: txType === 'transfer' ? toWalletId : null, description: $('#txDescription').value.trim(), category: txType === 'transfer' ? 'Перевод' : $('#txCategory').value, forecastMode: txType === 'transfer' ? 'normal' : $('#txForecastMode').value, occurredAt };
       if (editId) updateTransaction(editId, data); else createTransaction(data);
       closeModal(); $('#quickInput').value = ''; pendingQuickType = null; updateQuickUi();
     });
@@ -679,7 +753,7 @@
     const amount = Math.round(Number(data.amount));
     if (!Number.isSafeInteger(amount) || amount <= 0) { toast('Сумма должна быть положительным целым числом', 'error'); return; }
     if (data.type === 'transfer' && data.walletId === data.toWalletId) { toast('Нельзя перевести деньги в тот же кошелёк', 'error'); return; }
-    const stamp = nowISO(); const tx = { id: uid(), type: data.type, amount, walletId: data.walletId, toWalletId: data.type === 'transfer' ? data.toWalletId : null, description: (data.description || '').trim(), category: data.type === 'transfer' ? 'Перевод' : data.category || 'Прочее', occurredAt: data.occurredAt || stamp, createdAt: stamp, updatedAt: stamp, deletedAt: null };
+    const stamp = nowISO(); const tx = { id: uid(), type: data.type, amount, walletId: data.walletId, toWalletId: data.type === 'transfer' ? data.toWalletId : null, description: (data.description || '').trim(), category: data.type === 'transfer' ? 'Перевод' : data.category || 'Прочее', forecastMode: data.type === 'transfer' ? 'normal' : (data.forecastMode === 'one-time' ? 'one-time' : 'normal'), occurredAt: data.occurredAt || stamp, createdAt: stamp, updatedAt: stamp, deletedAt: null };
     state.transactions.push(tx); audit('create', 'transaction', tx.id, null, tx); recordUndo('transaction', tx.id, null, tx); persist();
     toast(`${tx.type === 'income' ? 'Получено' : tx.type === 'expense' ? 'Расход записан' : 'Перевод записан'} · ${money(tx.amount)}`);
   }
@@ -749,8 +823,8 @@
     const blob = new Blob([content], { type: mime }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); window.setTimeout(() => URL.revokeObjectURL(url), 1200);
   }
   function exportBackup() {
-    const payload = { app: 'VIGER MONEY', version: 1, exportedAt: nowISO(), state };
-    downloadFile(`viger-money-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json;charset=utf-8'); toast('Резервная копия подготовлена');
+    const payload = { app: 'V Money', version: 2, exportedAt: nowISO(), state };
+    downloadFile(`v-money-backup-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json;charset=utf-8'); toast('Резервная копия подготовлена');
   }
   function csvCell(value) { const s = String(value ?? ''); return `"${s.replace(/"/g, '""')}"`; }
   function exportCSV() {
@@ -758,18 +832,18 @@
     sortedTransactions().forEach(tx => lines.push([tx.id, new Date(tx.occurredAt).toLocaleString('ru-RU'), tx.type === 'income' ? 'Приход' : tx.type === 'expense' ? 'Расход' : 'Перевод', tx.amount, walletName(tx.walletId), tx.toWalletId ? walletName(tx.toWalletId) : '', tx.category, tx.description, 'Активна']));
     const deleted = state.transactions.filter(tx => tx.deletedAt).sort((a, b) => new Date(b.deletedAt) - new Date(a.deletedAt));
     deleted.forEach(tx => lines.push([tx.id, new Date(tx.occurredAt).toLocaleString('ru-RU'), tx.type === 'income' ? 'Приход' : tx.type === 'expense' ? 'Расход' : 'Перевод', tx.amount, walletName(tx.walletId), tx.toWalletId ? walletName(tx.toWalletId) : '', tx.category, tx.description, `Удалена ${new Date(tx.deletedAt).toLocaleString('ru-RU')}`]));
-    const csv = '\ufeff' + lines.map(row => row.map(csvCell).join(';')).join('\r\n'); downloadFile(`viger-money-transactions-${new Date().toISOString().slice(0, 10)}.csv`, csv, 'text/csv;charset=utf-8'); toast('CSV-файл подготовлен');
+    const csv = '\ufeff' + lines.map(row => row.map(csvCell).join(';')).join('\r\n'); downloadFile(`v-money-transactions-${new Date().toISOString().slice(0, 10)}.csv`, csv, 'text/csv;charset=utf-8'); toast('CSV-файл подготовлен');
   }
   function importBackup(file) {
     const reader = new FileReader(); reader.onerror = () => toast('Не удалось прочитать файл', 'error');
     reader.onload = () => {
       try {
         const data = JSON.parse(reader.result); const imported = data?.state || data;
-        if (!imported || !Array.isArray(imported.wallets) || !Array.isArray(imported.transactions) || !Array.isArray(imported.goals)) throw new Error('Структура файла не похожа на резервную копию VIGER MONEY.');
+        if (!imported || !Array.isArray(imported.wallets) || !Array.isArray(imported.transactions) || !Array.isArray(imported.goals)) throw new Error('Структура файла не похожа на резервную копию V Money.');
         const hasConflictingLocal = state.transactions.length || state.goals.length || state.wallets.some(w => Number(w.initialBalance) !== 0);
         confirmAction('Восстановить резервную копию?', `Будут заменены текущие данные на содержимое файла. ${hasConflictingLocal ? 'Перед продолжением лучше скачать копию текущих данных.' : ''} Импортированный баланс будет вычислен из кошельков и операций.`, async () => {
-          const incoming = clone(imported); incoming.settings = { ...defaultState().settings, ...(incoming.settings || {}) }; incoming.audit = Array.isArray(incoming.audit) ? incoming.audit : []; incoming.undoStack = [];
-          if (!Array.isArray(incoming.transactions) || !Array.isArray(incoming.wallets) || !Array.isArray(incoming.goals)) return toast('Файл повреждён', 'error');
+          const incoming = clone(imported); incoming.settings = { ...defaultState().settings, ...(incoming.settings || {}) }; incoming.audit = Array.isArray(incoming.audit) ? incoming.audit : []; incoming.plannedEvents = Array.isArray(incoming.plannedEvents) ? incoming.plannedEvents : []; incoming.transactions = incoming.transactions.map(tx => ({ ...tx, forecastMode: tx.forecastMode === 'one-time' ? 'one-time' : 'normal' })); incoming.undoStack = [];
+          if (!Array.isArray(incoming.transactions) || !Array.isArray(incoming.wallets) || !Array.isArray(incoming.goals) || !Array.isArray(incoming.plannedEvents)) return toast('Файл повреждён', 'error');
           state = incoming; await persist({ cloud: false }); renderAll(); toast('Данные восстановлены из резервной копии');
         }, 'Восстановить');
       } catch (error) { toast(error.message || 'Неверный JSON-файл', 'error'); }
@@ -831,14 +905,17 @@
   }
   function toRemoteWallet(w, userId) { return { id: w.id, user_id: userId, name: w.name, kind: w.kind, icon: w.icon, accent: w.accent, initial_balance: w.initialBalance, created_at: w.createdAt, updated_at: w.updatedAt, archived_at: w.archivedAt || null }; }
   function fromRemoteWallet(w) { return { id: w.id, name: w.name, kind: w.kind, icon: w.icon, accent: w.accent, initialBalance: Number(w.initial_balance) || 0, createdAt: w.created_at, updatedAt: w.updated_at, archivedAt: w.archived_at || null }; }
-  function toRemoteTx(tx, userId) { return { id: tx.id, user_id: userId, type: tx.type, amount: tx.amount, wallet_id: tx.walletId, to_wallet_id: tx.toWalletId || null, description: tx.description || '', category: tx.category || 'Прочее', occurred_at: tx.occurredAt, created_at: tx.createdAt, updated_at: tx.updatedAt, deleted_at: tx.deletedAt || null }; }
-  function fromRemoteTx(tx) { return { id: tx.id, type: tx.type, amount: Number(tx.amount) || 0, walletId: tx.wallet_id, toWalletId: tx.to_wallet_id || null, description: tx.description || '', category: tx.category || 'Прочее', occurredAt: tx.occurred_at, createdAt: tx.created_at, updatedAt: tx.updated_at, deletedAt: tx.deleted_at || null }; }
+  function toRemoteTx(tx, userId) { return { id: tx.id, user_id: userId, type: tx.type, amount: tx.amount, wallet_id: tx.walletId, to_wallet_id: tx.toWalletId || null, description: tx.description || '', category: tx.category || 'Прочее', forecast_mode: tx.forecastMode === 'one-time' ? 'one-time' : 'normal', occurred_at: tx.occurredAt, created_at: tx.createdAt, updated_at: tx.updatedAt, deleted_at: tx.deletedAt || null }; }
+  function fromRemoteTx(tx) { return { id: tx.id, type: tx.type, amount: Number(tx.amount) || 0, walletId: tx.wallet_id, toWalletId: tx.to_wallet_id || null, description: tx.description || '', category: tx.category || 'Прочее', forecastMode: tx.forecast_mode === 'one-time' ? 'one-time' : 'normal', occurredAt: tx.occurred_at, createdAt: tx.created_at, updatedAt: tx.updated_at, deletedAt: tx.deleted_at || null }; }
+  function toRemotePlannedEvent(event, userId) { return { id: event.id, user_id: userId, type: event.type, amount: event.amount, event_date: event.date, description: event.description || '', created_at: event.createdAt, updated_at: event.updatedAt, deleted_at: event.deletedAt || null }; }
+  function fromRemotePlannedEvent(event) { return { id: event.id, type: event.type, amount: Number(event.amount) || 0, date: event.event_date, description: event.description || '', createdAt: event.created_at, updatedAt: event.updated_at, deletedAt: event.deleted_at || null }; }
   function toRemoteGoal(goal, userId) { return { id: goal.id, user_id: userId, name: goal.name, target_amount: goal.targetAmount, wallet_id: goal.walletId || null, current_amount: goal.currentAmount || 0, icon: goal.icon || '◎', note: goal.note || '', created_at: goal.createdAt, updated_at: goal.updatedAt, deleted_at: goal.deletedAt || null }; }
   function fromRemoteGoal(g) { return { id: g.id, name: g.name, targetAmount: Number(g.target_amount) || 0, walletId: g.wallet_id || null, currentAmount: Number(g.current_amount) || 0, icon: g.icon || '◎', note: g.note || '', createdAt: g.created_at, updatedAt: g.updated_at, deletedAt: g.deleted_at || null }; }
   const remoteSpecs = [
     { local: 'wallets', table: 'wallets', toRemote: toRemoteWallet, fromRemote: fromRemoteWallet },
     { local: 'transactions', table: 'transactions', toRemote: toRemoteTx, fromRemote: fromRemoteTx },
     { local: 'goals', table: 'goals', toRemote: toRemoteGoal, fromRemote: fromRemoteGoal },
+    { local: 'plannedEvents', table: 'planned_events', toRemote: toRemotePlannedEvent, fromRemote: fromRemotePlannedEvent },
     { local: 'audit', table: 'audit_log', toRemote: (row, userId) => ({ id: row.id, user_id: userId, action: row.action, entity_type: row.entityType, entity_id: row.entityId, before_data: row.before ?? null, after_data: row.after ?? null, created_at: row.createdAt }), fromRemote: row => ({ id: row.id, action: row.action, entityType: row.entity_type, entityId: row.entity_id, before: row.before_data, after: row.after_data, createdAt: row.created_at, updatedAt: row.created_at }) }
   ];
   async function syncCloud() {
@@ -896,7 +973,7 @@
 
   function showAuditLog() {
     const actionNames = { create: 'Создано', update: 'Изменено', delete: 'Удалено', undo: 'Отменено', 'update-progress': 'Изменён прогресс', archive: 'Архивировано', restore: 'Восстановлено' };
-    const entityNames = { transaction: 'Операция', wallet: 'Кошелёк', goal: 'Цель' };
+    const entityNames = { transaction: 'Операция', wallet: 'Кошелёк', goal: 'Цель', plannedEvent: 'Планируемое событие' };
     const formatEntity = row => {
       if (!row) return '—';
       if (row.type && row.amount != null) return `${row.type === 'income' ? 'Приход' : row.type === 'expense' ? 'Расход' : 'Перевод'} · ${row.description || row.category || 'Без описания'} · ${money(row.amount)}`;
@@ -910,7 +987,7 @@
       return `<div class="audit-entry"><span class="audit-entry-icon">${entry.action === 'delete' ? '×' : entry.action === 'create' ? '+' : '↻'}</span><div class="audit-entry-main"><strong>${esc(actionNames[entry.action] || entry.action)} · ${esc(entityNames[entry.entityType] || entry.entityType)}</strong><small class="audit-detail">${esc(detail)}</small><small>${esc(new Date(entry.createdAt).toLocaleString('ru-RU'))}</small></div></div>`;
     }).join('')}</div><div class="modal-actions"><button type="button" class="secondary-btn" id="closeAuditLog">Закрыть</button><button type="button" class="primary-btn" id="exportAuditLog">Экспорт JSON ↗</button></div>` : `<div class="empty-state"><div class="empty-illustration">↻</div><h3>Изменений пока нет</h3><p>Когда ты создашь, изменишь или удалишь операцию, запись появится здесь.</p><button type="button" class="secondary-btn" id="closeAuditLog">Закрыть</button></div>`);
     $('#closeAuditLog').addEventListener('click', closeModal);
-    $('#exportAuditLog')?.addEventListener('click', () => { downloadFile(`viger-money-audit-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify({ exportedAt: nowISO(), audit: state.audit }, null, 2), 'application/json;charset=utf-8'); toast('Журнал исправлений экспортирован'); });
+    $('#exportAuditLog')?.addEventListener('click', () => { downloadFile(`v-money-audit-${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify({ exportedAt: nowISO(), audit: state.audit }, null, 2), 'application/json;charset=utf-8'); toast('Журнал исправлений экспортирован'); });
   }
 
   function startVoiceInput() {
@@ -937,6 +1014,8 @@
       const editWallet = event.target.closest('[data-edit-wallet]'); if (editWallet) { const w = findWallet(editWallet.dataset.editWallet); if (w) openWalletModal(w); return; }
       const archive = event.target.closest('[data-archive-wallet]'); if (archive) { archiveWallet(archive.dataset.archiveWallet); return; }
       const restoreWallet = event.target.closest('[data-restore-wallet]'); if (restoreWallet) { const w = findWallet(restoreWallet.dataset.restoreWallet); if (w) { w.archivedAt = null; w.updatedAt = nowISO(); audit('restore', 'wallet', w.id, null, w); persist(); toast('Кошелёк восстановлен'); } return; }
+      const editPlan = event.target.closest('[data-edit-plan]'); if (editPlan) { const plan = (state.plannedEvents || []).find(item => item.id === editPlan.dataset.editPlan && !item.deletedAt); if (plan) openPlannedEventModal(plan); return; }
+      const deletePlan = event.target.closest('[data-delete-plan]'); if (deletePlan) { deletePlannedEvent(deletePlan.dataset.deletePlan); return; }
       const editGoal = event.target.closest('[data-edit-goal]'); if (editGoal) { const g = state.goals.find(item => item.id === editGoal.dataset.editGoal); if (g) openGoalModal(g); return; }
       const deleteGoal = event.target.closest('[data-delete-goal]'); if (deleteGoal) { const g = state.goals.find(item => item.id === deleteGoal.dataset.deleteGoal); if (g) confirmAction('Удалить цель?', `Цель «${g.name}» будет удалена. Операции и кошельки не изменятся.`, () => { const before = clone(g); g.deletedAt = nowISO(); g.updatedAt = nowISO(); audit('delete', 'goal', g.id, before, g); persist(); toast('Цель удалена'); }, 'Удалить'); return; }
       const goalAdd = event.target.closest('[data-goal-add]'); if (goalAdd) { changeGoalProgress(goalAdd.dataset.goalAdd, 1); return; }
@@ -945,6 +1024,7 @@
       if (event.target.closest('#topAddBtn, #dashboardAddBtn, #historyAddBtn')) { openTransactionModal(); return; }
       if (event.target.closest('#newWalletBtn, #addWalletQuick')) { openWalletModal(); return; }
       if (event.target.closest('#newGoalBtn')) { openGoalModal(); return; }
+      if (event.target.closest('#addPlannedEvent')) { openPlannedEventModal(); return; }
     });
     $('#quickForm').addEventListener('submit', quickSubmit);
     $('#mobileQuickAdd')?.addEventListener('click', () => { navigate('dashboard'); window.setTimeout(() => { const input = $('#quickInput'); input?.scrollIntoView({ behavior: 'smooth', block: 'center' }); input?.focus({ preventScroll: true }); }, 80); });
@@ -988,7 +1068,7 @@
   async function init() {
     const loaded = await storageGet();
     if (loaded && Array.isArray(loaded.wallets) && Array.isArray(loaded.transactions)) {
-      state = loaded; state.settings = { ...defaultState().settings, ...(state.settings || {}) }; state.goals = Array.isArray(state.goals) ? state.goals : []; state.audit = Array.isArray(state.audit) ? state.audit : []; state.undoStack = Array.isArray(state.undoStack) ? state.undoStack : [];
+      state = loaded; state.settings = { ...defaultState().settings, ...(state.settings || {}) }; state.goals = Array.isArray(state.goals) ? state.goals : []; state.plannedEvents = Array.isArray(state.plannedEvents) ? state.plannedEvents : []; state.transactions = state.transactions.map(tx => ({ ...tx, forecastMode: tx.forecastMode === 'one-time' ? 'one-time' : 'normal' })); state.audit = Array.isArray(state.audit) ? state.audit : []; state.undoStack = Array.isArray(state.undoStack) ? state.undoStack : [];
     } else { state = defaultState(); await storageSet(state); }
     session = readSession();
     bindEvents(); renderAll(); updateQuickUi();
